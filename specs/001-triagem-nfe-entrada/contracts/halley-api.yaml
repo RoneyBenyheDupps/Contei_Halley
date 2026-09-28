@@ -1,0 +1,415 @@
+openapi: 3.0.3
+info:
+  title: Contei - Triagem de NF-e de entrada para o Halley
+  version: 0.1.0
+  description: >-
+    Contrato proposto do backend fiscal, chamado somente pelo backend do Halley.
+    O navegador não chama o Contei. O Halley responde pela interface e pela
+    identidade autenticada; o Halley emite JWT assinado, curto e exclusivo para
+    o Contei com sub, permissão fiscal, iss, aud, iat e exp. O JWT não contém
+    empresa; Halley e Contei atendem uma única empresa, cujo CNPJ fica
+    configurado no Contei. O Halley só emite o JWT para usuários com permissão
+    fiscal; o Contei verifica assinatura e claims localmente, sem consultar o
+    Halley a cada chamada.
+servers:
+  - url: /api
+security:
+  - halleyJwt: []
+paths:
+  /v1/triagem/nfe:
+    get:
+      operationId: listInboundNfe
+      summary: Lista documentos de entrada, inclusive os ainda fora da triagem
+      description: >-
+        Período refere-se à data de entrada na Qive. Sem filtro de decisão,
+        inclui documentos aguardando XML, cancelados sem XML e já decididos,
+        desde que incorporados pela consulta de NF-e classificadas pela Qive
+        como recebidas para a empresa. A API não promete descobrir notas apenas
+        citadas. Toda nota incorporada passa pela conferência do CNPJ
+        destinatário no XML. Não expõe registros técnicos sem data de entrada
+        confirmada ou fora do corte de ativação. Só a permissão fiscal do
+        piloto pode consultar.
+      parameters:
+        - name: from
+          in: query
+          description: Início inclusivo do período de entrada na Qive (UTC).
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Fim exclusivo do período de entrada na Qive (UTC).
+          schema: { type: string, format: date-time }
+        - name: decision
+          in: query
+          description: Filtra pela decisão atual; UNDECIDED inclui documentos ainda sem XML.
+          schema:
+            type: string
+            enum: [UNDECIDED, NO_ACTION, TREATMENT_PENDING]
+        - name: query
+          in: query
+          description: Chave de acesso exata ou número da NF-e.
+          schema: { type: string }
+        - name: cursor
+          in: query
+          description: Cursor opaco retornado na página anterior.
+          schema: { type: string }
+        - name: limit
+          in: query
+          description: Tamanho de página positivo; teto operacional depende de medição e será publicado antes da implementação.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Página de documentos ordenada por entrada na Qive e chave.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocumentSummary' }
+                  nextCursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/triagem/nfe/{accessKey}:
+    parameters:
+      - $ref: '#/components/parameters/AccessKey'
+    get:
+      operationId: getInboundNfe
+      summary: Consulta evidências, situação, recomendação e histórico completo
+      responses:
+        '200':
+          description: Documento preservado e projeção atual para o Halley.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/triagem/nfe/{accessKey}/xml/{occurrenceId}:
+    parameters:
+      - $ref: '#/components/parameters/AccessKey'
+      - name: occurrenceId
+        in: path
+        required: true
+        description: ID de uma ocorrência XML listada no detalhe.
+        schema: { type: string }
+    get:
+      operationId: getPreservedXml
+      summary: Devolve os bytes preservados de uma versão XML
+      description: >-
+        Não reconstrói nem normaliza XML. Ocorre somente para versão ligada à
+        NF-e da empresa autorizada. XML técnico inválido não é exposto aqui.
+      responses:
+        '200':
+          description: XML preservado byte a byte.
+          headers:
+            ETag:
+              description: SHA-256 do conteúdo para conferência de integridade.
+              schema: { type: string }
+          content:
+            application/xml:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/triagem/nfe/{accessKey}/events/{occurrenceId}/content:
+    parameters:
+      - $ref: '#/components/parameters/AccessKey'
+      - name: occurrenceId
+        in: path
+        required: true
+        description: ID de uma ocorrência EVENT listada no detalhe da mesma NF-e.
+        schema: { type: string }
+    get:
+      operationId: getPreservedEventContent
+      summary: Consulta o conteúdo integral preservado de um evento Qive
+      description: >-
+        Chamado somente pelo backend do Halley com JWT fiscal válido, inclusive
+        após desativação da integração. Devolve o item completo de Events ou
+        Manifestations em JSON canônico preservado, sem reconstruir campos.
+        Só aceita ocorrência EVENT ligada à chave da NF-e no escopo autorizado;
+        outros tipos, chaves ou IDs retornam 404.
+      responses:
+        '200':
+          description: Conteúdo completo do evento preservado.
+          headers:
+            ETag:
+              description: SHA-256 dos bytes JSON devolvidos.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/triagem/nfe/{accessKey}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/AccessKey'
+    post:
+      operationId: recordTriageDecision
+      summary: Registra ou corrige uma decisão humana sem apagar as anteriores
+      description: >-
+        Autor e permissão fiscal vêm exclusivamente da credencial verificada;
+        toda decisão e correção fica auditada com autor e evidências. Decisão
+        baseada em reviewVersion desatualizada retorna 409. Consultar a chave
+        de idempotência antes de comparar a versão: a mesma chave, ator e corpo
+        retorna a resposta original mesmo após avanço da revisão; reutilização
+        com outro ator ou conteúdo retorna 409. Para pedido novo, decisão e
+        avanço da revisão ocorrem na mesma transação.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: UUID único gerado pelo Halley para esta tentativa lógica.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionRequest' }
+      responses:
+        '201':
+          description: Decisão criada ou resposta idempotente da mesma tentativa.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Revisão desatualizada ou chave de idempotência reutilizada com outro conteúdo.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conflict' }
+        '422':
+          description: Documento fora da triagem, motivo incompatível ou observação obrigatória ausente.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+components:
+  securitySchemes:
+    halleyJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        JWT assinado e exclusivo emitido pelo Halley com sub, permissão fiscal,
+        iss, aud do Contei, iat e exp; sem empresa. O Contei valida assinatura,
+        emissor, audiência, algoritmo permitido e expiração localmente, sem
+        consulta por chamada nem revogação imediata. exp é verificado sem
+        tolerância; iat é aceito até a tolerância de relógio configurada
+        (HALLEY_JWT_IAT_TOLERANCE_SECONDS, no mínimo 1 s) à frente do relógio
+        do Contei, comparada em segundos inteiros (relógio do Contei
+        truncado), para que diferença pequena entre servidores ou iat
+        fracionário não recuse credencial recém-emitida. nbf não faz parte do
+        contrato; se presente, é verificado sem tolerância. O valor da
+        tolerância será acordado com o Halley junto com a política de
+        expiração. Chave e algoritmo serão
+        acordados com o Halley; a emissão somente a usuários com permissão
+        fiscal será provada antes do piloto.
+  parameters:
+    AccessKey:
+      name: accessKey
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9]{44}$' }
+  responses:
+    BadRequest:
+      description: Filtro, chave ou corpo malformado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Credencial ausente, inválida ou vencida.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Permissão fiscal do piloto ausente.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Chave não localizada no escopo autorizado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    Conflict:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            currentReviewVersion: { type: integer, minimum: 0 }
+    DocumentSummary:
+      type: object
+      required: [accessKey, captureState, triageState, canceled, reviewVersion,
+        documentRevision, hasDocumentUpdate, hasDocumentUpdateAfterDecision,
+        technicalIssueActive]
+      properties:
+        accessKey: { type: string, pattern: '^[0-9]{44}$' }
+        number: { type: string, nullable: true }
+        emitterName: { type: string, nullable: true }
+        emitterCnpj: { type: string, nullable: true, pattern: '^[0-9]{14}$' }
+        receiverName: { type: string, nullable: true }
+        receiverCnpj: { type: string, nullable: true, pattern: '^[0-9]{14}$' }
+        totalAmount: { type: string, nullable: true, description: vNF como string decimal exata; decimal(15,2) no MSSQL, sem ponto flutuante. }
+        issuedAt: { type: string, format: date-time, nullable: true }
+        qiveCreatedAt: { type: string, format: date-time, nullable: true }
+        origin: { type: string, nullable: true }
+        qiveStatus: { type: string, nullable: true }
+        captureState:
+          type: string
+          enum: [AWAITING_XML, CANCELED_XML_UNAVAILABLE, XML_VERIFIED, TECHNICAL_FOLLOWUP]
+        triageState:
+          type: string
+          enum: [NOT_ELIGIBLE, AWAITING_TRIAGE, DECIDED]
+        canceled: { type: boolean }
+        reviewVersion: { type: integer, minimum: 0 }
+        documentRevision: { type: integer, minimum: 0 }
+        hasDocumentUpdate: { type: boolean }
+        hasDocumentUpdateAfterDecision: { type: boolean }
+        technicalIssueActive: { type: boolean }
+        currentDecision:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Decision'
+    DocumentDetail:
+      allOf:
+        - $ref: '#/components/schemas/DocumentSummary'
+        - type: object
+          required: [evidence, occurrences, decisions, xmlVersions]
+          properties:
+            evidence: { $ref: '#/components/schemas/Evidence' }
+            recommendation:
+              type: object
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/Recommendation'
+            occurrences:
+              type: array
+              description: Histórico documental integral, em ordem de observação.
+              items: { $ref: '#/components/schemas/Occurrence' }
+            decisions:
+              type: array
+              description: Histórico integral de decisões, em ordem de gravação.
+              items: { $ref: '#/components/schemas/Decision' }
+            xmlVersions:
+              type: array
+              items: { $ref: '#/components/schemas/XmlVersion' }
+    Evidence:
+      type: object
+      required: [companyCnpj, receiverCnpj, recipientCnpjMismatch,
+        canceled, documentRevision]
+      properties:
+        companyCnpj: { type: string, pattern: '^[0-9]{14}$' }
+        receiverCnpj: { type: string, nullable: true, pattern: '^[0-9]{14}$' }
+        recipientCnpjMismatch: { type: boolean, nullable: true }
+        canceled: { type: boolean }
+        documentRevision: { type: integer, minimum: 0 }
+        xmlSha256: { type: string, nullable: true }
+        xmlOccurrenceId: { type: string, nullable: true }
+        qiveStatus: { type: string, nullable: true }
+        origin: { type: string, nullable: true }
+        consideredOccurrenceIds:
+          type: array
+          items: { type: string }
+        consideredOccurrences:
+          type: array
+          description: IDs e SHA-256 completos das ocorrências consideradas na evidência.
+          items:
+            type: object
+            required: [id, kind, sourceSection, sha256]
+            properties:
+              id: { type: string }
+              kind: { type: string, enum: [SNAPSHOT, XML, EVENT] }
+              sourceSection: { type: string, enum: [NFE, EVENTS, MANIFESTATIONS] }
+              sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+    Recommendation:
+      type: object
+      required: [outcome, reasonCode]
+      properties:
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        reasonCode:
+          type: string
+          enum: [RECIPIENT_CNPJ_MISMATCH, NO_RELEVANT_DIVERGENCE]
+    Occurrence:
+      type: object
+      required: [id, kind, observedAt, source, sourceSection, sha256, contentPath]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [SNAPSHOT, XML, EVENT] }
+        eventType: { type: string, nullable: true }
+        eventAt: { type: string, format: date-time, nullable: true }
+        observedAt: { type: string, format: date-time }
+        source: { type: string, enum: [QIVE] }
+        sourceSection: { type: string, enum: [NFE, EVENTS, MANIFESTATIONS] }
+        origin: { type: string, nullable: true }
+        qiveStatus: { type: string, nullable: true }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 do payload completo preservado. }
+        contentPath:
+          type: string
+          nullable: true
+          description: Rota autenticada de conteúdo integral quando kind=EVENT; nula nos demais tipos.
+        xmlValid: { type: boolean, nullable: true }
+    XmlVersion:
+      type: object
+      required: [occurrenceId, observedAt, sha256, downloadPath]
+      properties:
+        occurrenceId: { type: string }
+        observedAt: { type: string, format: date-time }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        downloadPath: { type: string }
+        isOriginal: { type: boolean }
+    Outcome:
+      type: string
+      enum: [NO_ACTION, TREATMENT_PENDING]
+    DecisionRequest:
+      type: object
+      description: >-
+        OTHER exige observação não vazia; os demais motivos aceitam observação
+        opcional. Motivos NO_RELEVANT_DIVERGENCE e
+        ACCEPTED_DIVERGENCE_OR_SITUATION só valem para NO_ACTION; os outros
+        três só valem para TREATMENT_PENDING.
+      required: [expectedReviewVersion, outcome, reasonCode]
+      additionalProperties: false
+      properties:
+        expectedReviewVersion: { type: integer, minimum: 0 }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        reasonCode:
+          type: string
+          enum: [NO_RELEVANT_DIVERGENCE, ACCEPTED_DIVERGENCE_OR_SITUATION,
+            RECIPIENT_CNPJ_MISMATCH, CANCELED_NFE, OTHER]
+        observation: { type: string }
+    Decision:
+      type: object
+      required: [id, sequence, outcome, reasonCode, actorId, actorRole,
+        decidedAt, basisReviewVersion, basisDocumentRevision, evidenceSnapshot]
+      properties:
+        id: { type: string }
+        sequence: { type: integer, minimum: 1 }
+        outcome: { $ref: '#/components/schemas/Outcome' }
+        reasonCode: { type: string }
+        observation: { type: string, nullable: true }
+        actorId: { type: string }
+        actorRole: { type: string }
+        decidedAt: { type: string, format: date-time }
+        basisReviewVersion: { type: integer, minimum: 0 }
+        basisDocumentRevision: { type: integer, minimum: 0 }
+        evidenceSnapshot: { $ref: '#/components/schemas/Evidence' }
+    DecisionReceipt:
+      type: object
+      required: [reviewVersion, decision]
+      properties:
+        reviewVersion: { type: integer, minimum: 1 }
+        decision: { $ref: '#/components/schemas/Decision' }

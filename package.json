@@ -1,0 +1,28 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "migrate": "node src/db.ts migrate",
+    "provision": "node src/provision.ts",
+    "test": "node --env-file-if-exists=.env.test --test --test-concurrency=1 tests/api.test.ts tests/sync.test.ts tests/triagem.test.ts tests/main.test.ts",
+    "test:qive": "node --test tests/qive-live.test.ts",
+    "test:qive:discovery": "node --env-file=.env.test scripts/qive-discovery.mjs discover 2026-09-25T15:00:00.000Z 2026-09-25T16:00:00.000Z",
+    "test:qive:cycle": "node --env-file=.env.test scripts/qive-discovery.mjs cycle 2026-09-25T15:00:00.000Z 2026-09-25T16:00:00.000Z 60000",
+    "test:entrypoints": "node --env-file-if-exists=.env.test --test tests/entrypoints.test.ts",
+    "test:db:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-test-db.ps1",
+    "start": "node src/main.ts"
+  },
+  "dependencies": {
+    "claude": "^0.1.1",
+    "jose": "6.2.12",
+    "lossless-json": "4.3.1",
+    "mssql": "12.7.2",
+    "saxes": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/mssql": "12.3.0",
+    "@types/node": "24.10.4",
+    "typescript": "5.9.3"
+  }
+}
