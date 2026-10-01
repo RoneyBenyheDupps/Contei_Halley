@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { KeyObject } from 'node:crypto';
 import { jwtVerify } from 'jose';
-import { ConflictError, getDocumentDetail, getOccurrenceContent, listDocuments, NotFoundError, recordDecision, type SqlPool } from './db.ts';
+import { ConflictError, getDocumentDetail, getDocumentItems, getOccurrenceContent, listDocuments, NotFoundError, recordDecision, type SqlPool } from './db.ts';
 import { InvalidFiscalInput } from './triagem.ts';
 
 export type ApiConfig = {
@@ -93,6 +93,16 @@ export function createApi(pool: SqlPool, config: ApiConfig) {
       if (!match) { json(response, 404, { code: 'NOT_FOUND', message: 'Rota não encontrada' }); return; }
       const [, accessKey, suffix] = match;
       if (request.method === 'GET' && !suffix) { json(response, 200, await getDocumentDetail(pool, accessKey)); return; }
+      if (request.method === 'GET' && suffix === 'items') {
+        const versions = url.searchParams.getAll('xmlOccurrenceId');
+        if (versions.length > 1 || versions.length === 1 && (!/^[1-9][0-9]*$/.test(versions[0]) || BigInt(versions[0]) > 9223372036854775807n)) {
+          throw new InvalidFiscalInput('INVALID_FILTER', 'Versão XML inválida');
+        }
+        const result = await getDocumentItems(pool, accessKey, versions[0]);
+        if ('errorCode' in result && result.xmlVersion) console.warn(JSON.stringify({ event: 'ITEM_EXTRACTION_FAILED', xmlOccurrenceId: result.xmlVersion.occurrenceId, errorCode: result.errorCode }));
+        json(response, 200, result);
+        return;
+      }
       const xmlMatch = /^xml\/(\d+)$/.exec(suffix || '');
       const eventMatch = /^events\/(\d+)\/content$/.exec(suffix || '');
       if (request.method === 'GET' && (xmlMatch || eventMatch)) {

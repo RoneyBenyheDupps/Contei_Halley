@@ -43,7 +43,7 @@ test('entrypoints TS e compilados: imports, migrate e inicialização da API', a
     const pool = await createPool('deploy');
     try {
       const versions = await pool.request().query('SELECT version FROM contei.Migration ORDER BY version');
-      assert.deepEqual(versions.recordset.map((row) => row.version), ['000', '001']);
+      assert.deepEqual(versions.recordset.map((row) => row.version), ['000', '001', '002']);
     } finally { await pool.close(); }
     succeeds(['--test', join(build, 'tests', 'main.test.js')]);
     t.diagnostic('API compilada: inicialização e consulta HTTP com JWT sintético aprovadas');

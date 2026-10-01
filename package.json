@@ -5,7 +5,7 @@
     "typecheck": "tsc --noEmit",
     "migrate": "node src/db.ts migrate",
     "provision": "node src/provision.ts",
-    "test": "node --env-file-if-exists=.env.test --test --test-concurrency=1 tests/api.test.ts tests/sync.test.ts tests/triagem.test.ts tests/main.test.ts",
+    "test": "node --env-file-if-exists=.env.test --test --test-concurrency=1 tests/api.test.ts tests/itens.test.ts tests/sync.test.ts tests/triagem.test.ts tests/main.test.ts",
     "test:qive": "node --test tests/qive-live.test.ts",
     "test:qive:discovery": "node --env-file=.env.test scripts/qive-discovery.mjs discover 2026-09-25T15:00:00.000Z 2026-09-25T16:00:00.000Z",
     "test:qive:cycle": "node --env-file=.env.test scripts/qive-discovery.mjs cycle 2026-09-25T15:00:00.000Z 2026-09-25T16:00:00.000Z 60000",

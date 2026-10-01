@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createHash } from 'node:crypto';
-import { createPool, ingestSnapshot, migrate, recordDecision, runMigration } from '../src/db.ts';
+import sql from 'mssql';
+import { createPool, getDocumentDetail, ingestSnapshot, migrate, recordDecision, runMigration, type SqlPool } from '../src/db.ts';
 import { inspectXml, isValidAccessKey, isValidCnpj, recommend, validateDecision } from '../src/triagem.ts';
 import { activateCompany, deactivateCompany } from '../src/provision.ts';
 
@@ -14,13 +15,13 @@ test('migrations são atômicas, reaplicáveis e protegem o histórico com o log
     await migrate(deploy);
     await migrate(deploy);
     const versions = await deploy.request().query('SELECT version FROM contei.Migration ORDER BY version');
-    assert.deepEqual(versions.recordset.map((r) => r.version), ['000', '001']);
+    assert.deepEqual(versions.recordset.map((r) => r.version), ['000', '001', '002']);
     await assert.rejects(
       runMigration(deploy, 'rollback_probe', "CREATE TABLE contei.RollbackProbe (id int NOT NULL); THROW 51000, 'probe', 1;"),
     );
     const table = await deploy.request().query("SELECT OBJECT_ID('contei.RollbackProbe') AS id");
     assert.equal(table.recordset[0].id, null);
-    for (const tableName of ['OcorrenciaDocumental', 'DecisaoTriagem']) {
+    for (const tableName of ['OcorrenciaDocumental', 'DecisaoTriagem', 'ItensNfeExtraidos']) {
       await assert.rejects(app.request().query(`UPDATE contei.${tableName} SET id = id WHERE 1 = 0`));
       await assert.rejects(app.request().query(`DELETE FROM contei.${tableName} WHERE 1 = 0`));
     }
@@ -40,6 +41,128 @@ test('migrations são atômicas, reaplicáveis e protegem o histórico com o log
     await app.close();
     await deploy.close();
   }
+});
+
+test('migração 002 grava um conjunto por XML e uma falha aberta por versão', { skip: !databaseReady && 'MSSQL de teste não configurado' }, async () => {
+  const deploy = await createPool('deploy');
+  const app = await createPool('app');
+  const key = String(Date.now()).padStart(44, '0');
+  let documentId: number | undefined;
+  let occurrenceId: number | undefined;
+  try {
+    await migrate(deploy);
+    const document = await app.request().input('key', key).query("INSERT INTO contei.DocumentoEntrada (empresaId,accessKey,scope) OUTPUT INSERTED.id VALUES (1,@key,'IN')");
+    documentId = Number(document.recordset[0].id);
+    const payload = Buffer.from('<synthetic/>');
+    const occurrence = await app.request().input('id', documentId).input('payload', payload).input('hash', createHash('sha256').update(payload).digest())
+      .query("INSERT INTO contei.OcorrenciaDocumental (documentoId,kind,sourceSection,rawPayload,contentType,sha256,isValidXml) OUTPUT INSERTED.id VALUES (@id,'XML','NFE',@payload,'application/xml',@hash,1)");
+    occurrenceId = Number(occurrence.recordset[0].id);
+    await assert.rejects(app.request().input('id', occurrenceId).query("INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (@id,'invalid',SYSDATETIMEOFFSET())"));
+    await assert.rejects(app.request().input('id', occurrenceId).query("INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (@id,'{}',SYSDATETIMEOFFSET())"));
+    const items = JSON.stringify([{ nItem: 1, product: { cProd: 'fixture' } }]);
+    await app.request().input('id', occurrenceId).input('items', items)
+      .query('INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (@id,@items,SYSDATETIMEOFFSET())');
+    await assert.rejects(app.request().input('id', occurrenceId).input('items', items)
+      .query('INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (@id,@items,SYSDATETIMEOFFSET())'));
+    await assert.rejects(app.request().input('items', items)
+      .query('INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (-1,@items,SYSDATETIMEOFFSET())'));
+    await assert.rejects(app.request().input('id', documentId).query("INSERT INTO contei.FalhaIntegracao (documentoId,kind,firstAt,lastAt,state,safeDetail) VALUES (@id,'ITEM_EXTRACTION',SYSDATETIMEOFFSET(),SYSDATETIMEOFFSET(),'OPEN','ITEM_STRUCTURE_INCOMPLETE')"));
+    const failureSql = "INSERT INTO contei.FalhaIntegracao (documentoId,kind,xmlOccurrenceId,firstAt,lastAt,state,safeDetail) VALUES (@documentId,'ITEM_EXTRACTION',@occurrenceId,SYSDATETIMEOFFSET(),SYSDATETIMEOFFSET(),'OPEN','ITEM_STRUCTURE_INCOMPLETE')";
+    await app.request().input('documentId', documentId).input('occurrenceId', occurrenceId).query(failureSql);
+    await assert.rejects(app.request().input('documentId', documentId).input('occurrenceId', occurrenceId).query(failureSql));
+    const rows = await app.request().input('id', occurrenceId).query('SELECT itemsJson FROM contei.ItensNfeExtraidos WHERE xmlOccurrenceId=@id');
+    assert.deepEqual(JSON.parse(rows.recordset[0].itemsJson), [{ nItem: 1, product: { cProd: 'fixture' } }]);
+  } finally {
+    if (documentId !== undefined) {
+      await deploy.request().input('id', documentId).query('DELETE FROM contei.FalhaIntegracao WHERE documentoId=@id');
+      if (occurrenceId !== undefined) await deploy.request().input('id', occurrenceId).query('DELETE FROM contei.ItensNfeExtraidos WHERE xmlOccurrenceId=@id');
+      await deploy.request().input('id', documentId).query('DELETE FROM contei.OcorrenciaDocumental WHERE documentoId=@id');
+      await deploy.request().input('id', documentId).query('DELETE FROM contei.DocumentoEntrada WHERE id=@id');
+    }
+    await app.close();
+    await deploy.close();
+  }
+});
+
+// Duas versões válidas da mesma chave: mudam destinatário e vNF, que não compõem a chave de acesso.
+async function ingestTwoVersions(app: SqlPool) {
+  const base = accessKey.slice(0, 34) + Math.floor(Math.random() * 1e8).toString().padStart(8, '0') + '3';
+  let sum = 0;
+  for (let i = 42, weight = 2; i >= 0; i--, weight = weight === 9 ? 2 : weight + 1) sum += Number(base[i]) * weight;
+  const digit = 11 - sum % 11;
+  const key = base + String(digit >= 10 ? 0 : digit);
+  await app.request().query("UPDATE contei.EmpresaFiscal SET status='ACTIVE' WHERE id=1");
+  const oldEntry = { accessKey: key, createdAt: '2026-09-24T10:00:00Z', origin: 'fixture', status: 'authorized', canceled: false,
+    rawPayload: Buffer.from(JSON.stringify({ AccessKey: key, Version: 'old' })), xmlBytes: Buffer.from(xml('11222333000181').toString().replaceAll(accessKey, key)) };
+  await ingestSnapshot(app, oldEntry);
+  await ingestSnapshot(app, { ...oldEntry, rawPayload: Buffer.from(JSON.stringify({ AccessKey: key, Version: 'new' })),
+    xmlBytes: Buffer.from(xml('11444777000161', '234.56').toString().replaceAll(accessKey, key)) });
+  const [oldVersion, newVersion] = (await getDocumentDetail(app, key)).xmlVersions;
+  return { key, oldEntry, oldVersion, newVersion };
+}
+
+const pointToVersion = (app: SqlPool, key: string, occurrenceId: string) => app.request().input('key', key).input('id', occurrenceId)
+  .query('UPDATE contei.DocumentoEntrada SET latestValidXmlOccurrenceId=@id WHERE accessKey=@key');
+
+test('replay de XML antigo não regride ponteiro nem cabeçalho da versão mais recente', { skip: !databaseReady && 'MSSQL de teste não configurado' }, async () => {
+  const app = await createPool('app');
+  try {
+    const { key, oldEntry, oldVersion, newVersion } = await ingestTwoVersions(app);
+    const before = await getDocumentDetail(app, key);
+    assert.equal(before.evidence.xmlOccurrenceId, newVersion.occurrenceId);
+    assert.deepEqual([before.receiverCnpj, before.totalAmount], ['11444777000161', '234.56']);
+    await ingestSnapshot(app, oldEntry);
+    const pointer = await app.request().input('key', key).query('SELECT latestValidXmlOccurrenceId FROM contei.DocumentoEntrada WHERE accessKey=@key');
+    assert.equal(String(pointer.recordset[0].latestValidXmlOccurrenceId), newVersion.occurrenceId);
+    const after = await getDocumentDetail(app, key);
+    assert.equal(after.evidence.xmlOccurrenceId, newVersion.occurrenceId);
+    assert.deepEqual([after.receiverCnpj, after.totalAmount, after.evidence.recipientCnpjMismatch, after.recommendation?.reasonCode],
+      ['11444777000161', '234.56', true, 'RECIPIENT_CNPJ_MISMATCH']);
+    assert.deepEqual(after.xmlVersions.map((version) => version.occurrenceId), [oldVersion.occurrenceId, newVersion.occurrenceId]);
+    await pointToVersion(app, key, oldVersion.occurrenceId);
+    const withHistoricalStalePointer = await getDocumentDetail(app, key);
+    assert.equal(withHistoricalStalePointer.evidence.xmlOccurrenceId, newVersion.occurrenceId);
+  } finally { await app.close(); }
+});
+
+test('nova decisão registra XML e SHA-256 da versão mais recente mesmo com ponteiro desatualizado', { skip: !databaseReady && 'MSSQL de teste não configurado' }, async () => {
+  const app = await createPool('app');
+  try {
+    const { key, oldVersion, newVersion } = await ingestTwoVersions(app);
+    await pointToVersion(app, key, oldVersion.occurrenceId);
+    const { reviewVersion } = await getDocumentDetail(app, key);
+    const decision = await recordDecision(app, key, { id: 'fiscal-fixture', role: 'fiscal' }, '23692598-b1c8-4516-9325-6e63c4eb7129',
+      { expectedReviewVersion: reviewVersion, outcome: 'TREATMENT_PENDING', reasonCode: 'RECIPIENT_CNPJ_MISMATCH' });
+    const evidence = decision.decision.evidenceSnapshot;
+    assert.deepEqual([evidence.xmlOccurrenceId, evidence.xmlSha256], [newVersion.occurrenceId, newVersion.sha256]);
+  } finally { await app.close(); }
+});
+
+test('conexão reutilizada volta a READ COMMITTED após transação SERIALIZABLE confirmada, desfeita ou abortada', { skip: !databaseReady && 'MSSQL de teste não configurado' }, async () => {
+  const app = await createPool('app');
+  const session = async () => (await app.request()
+    .query('SELECT @@SPID AS spid, transaction_isolation_level AS isolation FROM sys.dm_exec_sessions WHERE session_id=@@SPID')).recordset[0];
+  const serializable = async (end: (transaction: sql.Transaction) => Promise<unknown>) => {
+    const transaction = new sql.Transaction(app);
+    await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+    await end(transaction);
+    // O abort por XACT_ABORT devolve a conexão ao pool no ciclo seguinte.
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  try {
+    const initial = await session();
+    assert.equal(initial.isolation, 2);
+    await serializable((transaction) => transaction.commit());
+    assert.deepEqual(await session(), initial, 'após commit');
+    await serializable((transaction) => transaction.rollback());
+    assert.deepEqual(await session(), initial, 'após rollback');
+    await serializable(async (transaction) => {
+      await assert.rejects(new sql.Request(transaction).query('SET XACT_ABORT ON; SELECT 1/0'));
+      await assert.rejects(transaction.rollback());
+    });
+    assert.deepEqual(await session(), initial, 'após abort do servidor');
+    assert.equal(app.size, 1, 'todas as etapas usaram a mesma conexão do pool');
+  } finally { await app.close(); }
 });
 
 const accessKey = '3526091122233300018155001000000123100000123' + '0';

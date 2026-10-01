@@ -1,0 +1,210 @@
+openapi: 3.0.3
+info:
+  title: Contei - Consulta dos itens declarados em NF-e de entrada
+  version: 0.1.0
+  description: >-
+    Extensão do contrato specs/001-triagem-nfe-entrada/contracts/halley-api.yaml.
+    O backend do Halley chama esta consulta com o mesmo JWT e a mesma permissão
+    fiscal da consulta existente da nota. O navegador não chama o Contei.
+servers:
+  - url: /api
+security:
+  - halleyJwt: []
+paths:
+  /v1/triagem/nfe/{accessKey}/items:
+    get:
+      operationId: getInboundNfeItems
+      summary: Consulta itens declarados em uma versão preservada do XML
+      description: >-
+        Sem xmlOccurrenceId, seleciona a última ocorrência XML válida na ordem
+        (observedAt,id), inclusive se um replay antigo deixou o ponteiro da nota
+        desatualizado. Uma versão com extração bem-sucedida devolve os itens já
+        armazenados; a primeira consulta extrai e armazena o conjunto completo.
+        Versões sem conjunto armazenado recebem nova tentativa em cada consulta.
+        A consulta nunca escolhe automaticamente uma versão anterior se a
+        selecionada falhar. Falhas de itens não alteram technicalIssueActive
+        da consulta existente da NF-e. Não calcula nem avalia tributos.
+      parameters:
+        - $ref: '#/components/parameters/AccessKey'
+        - name: xmlOccurrenceId
+          in: query
+          description: ID de uma versão XML válida listada no detalhe da mesma NF-e.
+          schema: { type: string, pattern: '^[1-9][0-9]*$' }
+      responses:
+        '200':
+          description: Itens completos ou condição explícita de indisponibilidade.
+          headers:
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AvailableItems'
+                  - $ref: '#/components/schemas/UnavailableWithoutXml'
+                  - $ref: '#/components/schemas/ExtractionFailed'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+components:
+  securitySchemes:
+    halleyJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Mesmo contrato fiscal do Halley já definido em
+        specs/001-triagem-nfe-entrada/contracts/halley-api.yaml: assinatura,
+        emissor, audiência, algoritmo, sub, permissão fiscal, iat e exp verificados
+        pelo Contei. Nenhuma claim ou regra de autorização nova.
+  parameters:
+    AccessKey:
+      name: accessKey
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9]{44}$' }
+  responses:
+    BadRequest:
+      description: Chave ou identificador de versão malformado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Credencial ausente, inválida ou vencida.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Permissão fiscal ausente.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: >-
+        Nota fora do escopo ou versão inexistente, inválida ou pertencente a outra
+        nota; não revela a existência de documentos fora do escopo autorizado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Falha inesperada de serviço, integridade ou gravação do conjunto completo.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    SourceXml:
+      type: object
+      required: [occurrenceId, observedAt, sha256, downloadPath]
+      properties:
+        occurrenceId: { type: string, pattern: '^[1-9][0-9]*$' }
+        observedAt: { type: string, format: date-time }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        downloadPath:
+          type: string
+          description: Caminho de download autenticado da versão original.
+    AvailableItems:
+      type: object
+      additionalProperties: false
+      required: [status, accessKey, xmlVersion, items]
+      properties:
+        status: { type: string, enum: [AVAILABLE] }
+        accessKey: { type: string, pattern: '^[0-9]{44}$' }
+        xmlVersion: { $ref: '#/components/schemas/SourceXml' }
+        items:
+          type: array
+          minItems: 1
+          description: >-
+            Todos os det da versão, na ordem declarada, lidos do conjunto armazenado
+            após sucesso integral; nunca uma lista parcial.
+          items: { $ref: '#/components/schemas/DeclaredItem' }
+    UnavailableWithoutXml:
+      type: object
+      additionalProperties: false
+      required: [status, accessKey]
+      properties:
+        status:
+          type: string
+          enum: [AWAITING_XML, CANCELED_XML_UNAVAILABLE, TECHNICAL_FOLLOWUP]
+        accessKey: { type: string, pattern: '^[0-9]{44}$' }
+      description: Não inclui items nem xmlVersion.
+    ExtractionFailed:
+      type: object
+      additionalProperties: false
+      required: [status, accessKey, xmlVersion, errorCode]
+      properties:
+        status: { type: string, enum: [EXTRACTION_FAILED] }
+        accessKey: { type: string, pattern: '^[0-9]{44}$' }
+        xmlVersion: { $ref: '#/components/schemas/SourceXml' }
+        errorCode:
+          type: string
+          enum: [XML_STRUCTURE_UNSUPPORTED, ITEM_STRUCTURE_INCOMPLETE, TAX_MAPPING_UNSUPPORTED]
+          description: >-
+            Categoria estável e segura da falha; não expõe XML, campos fiscais nem
+            mensagens internas do parser.
+      description: >-
+        Não inclui items nem cria conjunto armazenado. Cada nova consulta dessa
+        versão tenta extrair novamente; outras versões são escolhidas explicitamente.
+    DeclaredItem:
+      type: object
+      additionalProperties: false
+      required: [nItem, product]
+      properties:
+        nItem: { type: integer, minimum: 1, maximum: 990 }
+        product: { $ref: '#/components/schemas/DeclaredProduct' }
+        taxes:
+          type: object
+          additionalProperties: false
+          properties:
+            ICMS: { $ref: '#/components/schemas/DeclaredTax' }
+            IPI: { $ref: '#/components/schemas/DeclaredTax' }
+            PIS: { $ref: '#/components/schemas/DeclaredTax' }
+            COFINS: { $ref: '#/components/schemas/DeclaredTax' }
+    DeclaredProduct:
+      type: object
+      additionalProperties: false
+      description: >-
+        Somente campos de det/prod presentes no XML. Quantidades, preços e valores
+        mantêm o texto decimal declarado, inclusive zeros finais.
+      properties:
+        cProd: { type: string }
+        xProd: { type: string }
+        NCM: { type: string }
+        CFOP: { type: string }
+        CEST: { type: string }
+        cEAN: { type: string }
+        cEANTrib: { type: string }
+        uCom: { type: string }
+        qCom: { type: string }
+        vUnCom: { type: string }
+        vProd: { type: string }
+        uTrib: { type: string }
+        qTrib: { type: string }
+        vUnTrib: { type: string }
+        vFrete: { type: string }
+        vSeg: { type: string }
+        vDesc: { type: string }
+        vOutro: { type: string }
+    DeclaredTax:
+      type: object
+      additionalProperties: false
+      required: [variant, fields]
+      properties:
+        variant:
+          type: string
+          description: Nome do subgrupo XML declarado, como ICMS00, ICMSSN101, IPITrib ou PISQtde.
+        fields:
+          type: object
+          minProperties: 1
+          additionalProperties: { type: string }
+          description: >-
+            Nomes XML dos códigos de situação, bases, alíquotas e valores da variante
+            mapeada no leiaute oficial. Valores são textos declarados; CST e CSOSN
+            continuam distintos, assim como vBC/pPIS e qBCProd/vAliqProd.

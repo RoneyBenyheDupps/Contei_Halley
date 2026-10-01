@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import sql from 'mssql';
 import { createHash } from 'node:crypto';
 import { inspectXml, InvalidFiscalInput, isValidAccessKey, recommend, validateDecision, type DecisionRequest, type XmlEvidence } from './triagem.ts';
+import { extractDeclaredItems, ItemExtractionError, type DeclaredItem, type ItemErrorCode } from './itens.ts';
 
 export type SqlPool = sql.ConnectionPool;
 export type SqlTransaction = sql.Transaction;
@@ -22,6 +23,12 @@ export async function createPool(kind: 'deploy' | 'app'): Promise<SqlPool> {
       encrypt: true,
       trustServerCertificate: process.env.MSSQL_TRUST_SERVER_CERTIFICATE === 'true',
       abortTransactionOnError: true,
+    },
+    pool: {
+      // O nível SERIALIZABLE de uma transação permanece na sessão após commit, rollback ou abort.
+      // Em vez do SELECT 1 padrão, reset() valida a conexão e reaplica READ COMMITTED antes de cada reuso.
+      // O tarn aguarda a Promise, embora o tipo publicado de validate declare boolean.
+      validate: (connection) => new Promise<boolean>((resolve) => connection.reset((error) => resolve(!error))) as unknown as boolean,
     },
   }).connect();
 }
@@ -49,8 +56,8 @@ export async function runMigration(pool: SqlPool, version: string, script: strin
 }
 
 export async function migrate(pool: SqlPool): Promise<void> {
-  for (const version of ['000', '001']) {
-    const script = await readFile(new URL(`../migrations/${version}_${version === '000' ? 'schema_version' : 'triagem_nfe'}.sql`, import.meta.url), 'utf8');
+  for (const [version, name] of [['000', 'schema_version'], ['001', 'triagem_nfe'], ['002', 'itens_nfe']]) {
+    const script = await readFile(new URL(`../migrations/${version}_${name}.sql`, import.meta.url), 'utf8');
     await runMigration(pool, version, script);
   }
   const appUser = process.env.MSSQL_APP_USER;
@@ -91,6 +98,12 @@ export class ConflictError extends Error {
 export class NotFoundError extends Error {}
 
 const digest = (bytes: Buffer): Buffer => createHash('sha256').update(bytes).digest();
+
+// Versão XML padrão: última ocorrência válida em (observedAt,id); latestValidXmlOccurrenceId é só projeção.
+function selectXmlVersion(request: sql.Request, documentId: number, occurrenceId: string | null = null) {
+  return request.input('documentId', sql.BigInt, documentId).input('selectedId', sql.BigInt, occurrenceId)
+    .query("SELECT TOP (1) id,observedAt,sha256 FROM contei.OcorrenciaDocumental WHERE documentoId=@documentId AND kind='XML' AND isValidXml=1 AND (@selectedId IS NULL OR id=@selectedId) ORDER BY observedAt DESC,id DESC");
+}
 
 async function insertOccurrence(transaction: SqlTransaction, documentId: number, kind: 'SNAPSHOT' | 'XML' | 'EVENT', section: 'NFE' | 'EVENTS' | 'MANIFESTATIONS', payload: Buffer, extra: { valid?: boolean | null; errorCode?: string | null; origin?: string | null; eventType?: string | null; eventXmlBytes?: Buffer } = {}): Promise<{ id: number; fresh: boolean }> {
   const hash = digest(payload);
@@ -150,25 +163,30 @@ export async function ingestSnapshot(pool: SqlPool, snapshot: InboundSnapshot): 
       changed ||= inserted.fresh;
     }
     const validXmlId = xml ? xmlOccurrence?.id : null;
+    const latestValid = await selectXmlVersion(new sql.Request(transaction), documentId);
+    const latestValidXmlId = latestValid.recordset[0]?.id ?? null;
+    // Replay de XML antigo não sobrescreve o cabeçalho projetado da versão mais recente.
+    const header = validXmlId && String(validXmlId) === String(latestValidXmlId) ? xml : null;
     const isVerified = !!validXmlId || document.captureState === 'XML_VERIFIED';
     const state = isVerified ? 'XML_VERIFIED' : xmlError ? 'TECHNICAL_BLOCKED' : 'AWAITING_XML';
     await new sql.Request(transaction)
       .input('id', sql.BigInt, documentId).input('state', sql.VarChar(20), state)
       .input('status', sql.NVarChar(100), snapshot.status).input('canceled', sql.Bit, snapshot.canceled)
       .input('changed', sql.Bit, changed).input('xmlId', sql.BigInt, validXmlId ?? null)
-      .input('number', sql.NVarChar(30), xml?.number ?? null)
-      .input('emitterName', sql.NVarChar(300), xml?.emitterName ?? null)
-      .input('emitterCnpj', sql.Char(14), xml?.emitterCnpj ?? null)
-      .input('receiverName', sql.NVarChar(300), xml?.receiverName ?? null)
-      .input('receiverCnpj', sql.Char(14), xml?.receiverCnpj ?? null)
-      .input('amount', sql.VarChar(16), xml?.totalAmount ?? null)
-      .input('issuedAt', sql.DateTimeOffset, xml ? new Date(xml.issuedAt) : null)
+      .input('latestXmlId', sql.BigInt, latestValidXmlId)
+      .input('number', sql.NVarChar(30), header?.number ?? null)
+      .input('emitterName', sql.NVarChar(300), header?.emitterName ?? null)
+      .input('emitterCnpj', sql.Char(14), header?.emitterCnpj ?? null)
+      .input('receiverName', sql.NVarChar(300), header?.receiverName ?? null)
+      .input('receiverCnpj', sql.Char(14), header?.receiverCnpj ?? null)
+      .input('amount', sql.VarChar(16), header?.totalAmount ?? null)
+      .input('issuedAt', sql.DateTimeOffset, header ? new Date(header.issuedAt) : null)
       .input('origin', sql.NVarChar(100), snapshot.origin)
       .query(`UPDATE contei.DocumentoEntrada SET
         lastCheckedAt=TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00'),
         captureState=@state, qiveStatusRaw=@status, canceled=@canceled,
         firstXmlOccurrenceId=COALESCE(firstXmlOccurrenceId,@xmlId),
-        latestValidXmlOccurrenceId=COALESCE(@xmlId,latestValidXmlOccurrenceId),
+        latestValidXmlOccurrenceId=COALESCE(@latestXmlId,latestValidXmlOccurrenceId),
         triageEnteredAt=CASE WHEN @xmlId IS NOT NULL AND triageEnteredAt IS NULL AND scope='IN' THEN TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00') ELSE triageEnteredAt END,
         number=COALESCE(@number,number), emitterName=COALESCE(@emitterName,emitterName), emitterCnpj=COALESCE(@emitterCnpj,emitterCnpj),
         receiverName=COALESCE(@receiverName,receiverName), receiverCnpj=COALESCE(@receiverCnpj,receiverCnpj),
@@ -231,7 +249,7 @@ export async function recordDecision(pool: SqlPool, accessKey: string, actor: Fi
     if (Number(document.reviewVersion) !== request.expectedReviewVersion) throw new ConflictError('Revisão desatualizada', Number(document.reviewVersion));
     const occurrences = await new sql.Request(transaction).input('id', sql.BigInt, documentId)
       .query('SELECT id,kind,sourceSection,sha256 FROM contei.OcorrenciaDocumental WHERE documentoId=@id ORDER BY id');
-    const xmlOccurrence = occurrences.recordset.find((row) => String(row.id) === String(document.latestValidXmlOccurrenceId));
+    const xmlOccurrence = (await selectXmlVersion(new sql.Request(transaction), documentId)).recordset[0];
     const company = await new sql.Request(transaction).query('SELECT cnpj FROM contei.EmpresaFiscal WHERE id=1');
     const companyCnpj = String(company.recordset[0].cnpj);
     const evidence = {
@@ -241,7 +259,7 @@ export async function recordDecision(pool: SqlPool, accessKey: string, actor: Fi
       canceled: !!document.canceled,
       documentRevision: Number(document.documentRevision),
       xmlSha256: xmlOccurrence?.sha256?.toString('hex') ?? null,
-      xmlOccurrenceId: document.latestValidXmlOccurrenceId ? String(document.latestValidXmlOccurrenceId) : null,
+      xmlOccurrenceId: xmlOccurrence ? String(xmlOccurrence.id) : null,
       qiveStatus: document.qiveStatusRaw, origin: document.origin,
       consideredOccurrenceIds: occurrences.recordset.map((row) => String(row.id)),
       consideredOccurrences: occurrences.recordset.map((row) => ({ id: String(row.id), kind: row.kind, sourceSection: row.sourceSection, sha256: row.sha256.toString('hex') })),
@@ -349,7 +367,7 @@ export async function getDocumentDetail(pool: SqlPool, accessKey: string) {
     throw error;
   }
   const current = decisions.recordset.at(-1);
-  const latestXml = occurrences.recordset.find((occurrence) => Number(occurrence.id) === Number(row.latestValidXmlOccurrenceId));
+  const latestXml = occurrences.recordset.filter((occurrence) => occurrence.kind === 'XML' && occurrence.isValidXml).at(-1);
   const summary = summaryFromRow({ ...row, currentDecisionId: current?.id ?? null, basisDocumentRevision: current?.basisDocumentRevision ?? null });
   summary.currentDecision = current ? decisionFromRow(current) : null;
   const companyCnpj = String(row.companyCnpj);
@@ -389,4 +407,85 @@ export async function getOccurrenceContent(pool: SqlPool, accessKey: string, occ
         AND (@kind='EVENT' OR o.isValidXml=1)`);
   if (!selected.recordset.length) throw new NotFoundError('Ocorrência não encontrada');
   return { bytes: selected.recordset[0].rawPayload as Buffer, sha256: selected.recordset[0].sha256.toString('hex') as string };
+}
+
+export async function getDocumentItems(pool: SqlPool, accessKey: string, selectedOccurrenceId?: string) {
+  const document = await pool.request().input('key', sql.Char(44), accessKey)
+    .query("SELECT id,captureState,canceled FROM contei.DocumentoEntrada WHERE empresaId=1 AND scope='IN' AND accessKey=@key");
+  if (!document.recordset.length) throw new NotFoundError('NF-e não encontrada');
+  const note = document.recordset[0];
+  const source = await selectXmlVersion(pool.request(), Number(note.id), selectedOccurrenceId ?? null);
+  if (!source.recordset.length) {
+    if (selectedOccurrenceId) throw new NotFoundError('XML não encontrado');
+    const status = note.canceled ? 'CANCELED_XML_UNAVAILABLE' : note.captureState === 'TECHNICAL_BLOCKED' ? 'TECHNICAL_FOLLOWUP' : 'AWAITING_XML';
+    return { status, accessKey };
+  }
+  const xml = source.recordset[0];
+  const xmlOccurrenceId = String(xml.id);
+  const xmlVersion = { occurrenceId: xmlOccurrenceId, observedAt: iso(xml.observedAt)!, sha256: (xml.sha256 as Buffer).toString('hex'),
+    downloadPath: `/api/v1/triagem/nfe/${accessKey}/xml/${xmlOccurrenceId}` };
+  const stored = await pool.request().input('id', sql.BigInt, xmlOccurrenceId)
+    .query('SELECT itemsJson FROM contei.ItensNfeExtraidos WHERE xmlOccurrenceId=@id');
+  if (stored.recordset.length) return { status: 'AVAILABLE', accessKey, xmlVersion, items: storedItems(stored.recordset[0].itemsJson) };
+  const payload = await pool.request().input('id', sql.BigInt, xmlOccurrenceId)
+    .query('SELECT rawPayload,sha256 FROM contei.OcorrenciaDocumental WHERE id=@id');
+  if (!payload.recordset.length || !digest(payload.recordset[0].rawPayload).equals(payload.recordset[0].sha256)) throw new Error('XML_INTEGRITY_FAILURE');
+  let items: DeclaredItem[];
+  try { items = extractDeclaredItems(payload.recordset[0].rawPayload); }
+  catch (error) {
+    if (!(error instanceof ItemExtractionError)) throw error;
+    await recordItemExtractionFailure(pool, Number(note.id), xmlOccurrenceId, error.code);
+    return { status: 'EXTRACTION_FAILED', accessKey, xmlVersion, errorCode: error.code };
+  }
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    await new sql.Request(transaction).query('SET XACT_ABORT ON');
+    const winner = await new sql.Request(transaction).input('id', sql.BigInt, xmlOccurrenceId)
+      .query('SELECT itemsJson FROM contei.ItensNfeExtraidos WITH (UPDLOCK,HOLDLOCK) WHERE xmlOccurrenceId=@id');
+    let result: DeclaredItem[];
+    if (winner.recordset.length) result = storedItems(winner.recordset[0].itemsJson);
+    else {
+      await new sql.Request(transaction).input('id', sql.BigInt, xmlOccurrenceId).input('items', sql.NVarChar(sql.MAX), JSON.stringify(items))
+        .query('INSERT INTO contei.ItensNfeExtraidos (xmlOccurrenceId,itemsJson,extractedAt) VALUES (@id,@items,TODATETIMEOFFSET(SYSUTCDATETIME(), \'+00:00\'))');
+      result = items;
+    }
+    await new sql.Request(transaction).input('id', sql.BigInt, xmlOccurrenceId)
+      .query("UPDATE contei.FalhaIntegracao SET state='RESOLVED',resolvedAt=TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00'),lastAt=TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00') WHERE xmlOccurrenceId=@id AND kind='ITEM_EXTRACTION' AND state='OPEN'");
+    await transaction.commit();
+    return { status: 'AVAILABLE', accessKey, xmlVersion, items: result };
+  } catch (error) {
+    try { await transaction.rollback(); } catch { /* XACT_ABORT may already have rolled back. */ }
+    throw error;
+  }
+}
+
+async function recordItemExtractionFailure(pool: SqlPool, documentId: number, xmlOccurrenceId: string, code: ItemErrorCode) {
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    await new sql.Request(transaction).query('SET XACT_ABORT ON');
+    const source = await new sql.Request(transaction).input('documentId', sql.BigInt, documentId).input('id', sql.BigInt, xmlOccurrenceId)
+      .query("SELECT id FROM contei.OcorrenciaDocumental WHERE id=@id AND documentoId=@documentId AND kind='XML' AND isValidXml=1");
+    if (!source.recordset.length) throw new NotFoundError('XML não encontrado');
+    const open = await new sql.Request(transaction).input('id', sql.BigInt, xmlOccurrenceId)
+      .query("SELECT id FROM contei.FalhaIntegracao WITH (UPDLOCK,HOLDLOCK) WHERE xmlOccurrenceId=@id AND kind='ITEM_EXTRACTION' AND state='OPEN'");
+    if (open.recordset.length) {
+      await new sql.Request(transaction).input('id', sql.BigInt, open.recordset[0].id).input('code', sql.NVarChar(500), code)
+        .query("UPDATE contei.FalhaIntegracao SET lastAt=TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00'),attempts=attempts+1,safeDetail=@code WHERE id=@id");
+    } else {
+      await new sql.Request(transaction).input('documentId', sql.BigInt, documentId).input('id', sql.BigInt, xmlOccurrenceId).input('code', sql.NVarChar(500), code)
+        .query("INSERT INTO contei.FalhaIntegracao (documentoId,kind,xmlOccurrenceId,firstAt,lastAt,attempts,state,safeDetail) VALUES (@documentId,'ITEM_EXTRACTION',@id,TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00'),TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00'),1,'OPEN',@code)");
+    }
+    await transaction.commit();
+  } catch (error) {
+    try { await transaction.rollback(); } catch { /* XACT_ABORT may already have rolled back. */ }
+    throw error;
+  }
+}
+
+function storedItems(value: string): DeclaredItem[] {
+  const items: unknown = JSON.parse(value);
+  if (!Array.isArray(items) || !items.length) throw new Error('ITEM_STORAGE_INTEGRITY_FAILURE');
+  return items as DeclaredItem[];
 }

@@ -42,13 +42,16 @@ export function isValidAccessKey(value: string): boolean {
   return Number(value[43]) === mod11Digit(value.slice(0, 43));
 }
 
-export function inspectXml(bytes: Buffer, expectedKey: string): XmlEvidence {
-  if (!isValidAccessKey(expectedKey)) throw new InvalidFiscalInput('INVALID_ACCESS_KEY', 'Chave de acesso inválida');
+export function decodeXml(bytes: Buffer): string {
   const declaration = bytes.subarray(0, 200).toString('ascii');
   const encoding = /<\?xml\b[^?]*\bencoding\s*=\s*["']([^"']+)["']/i.exec(declaration)?.[1] || 'utf-8';
-  let content: string;
-  try { content = new TextDecoder(encoding, { fatal: true }).decode(bytes); }
+  try { return new TextDecoder(encoding, { fatal: true }).decode(bytes); }
   catch { throw new InvalidFiscalInput('INVALID_XML_ENCODING', 'Codificação XML inválida'); }
+}
+
+export function inspectXml(bytes: Buffer, expectedKey: string): XmlEvidence {
+  if (!isValidAccessKey(expectedKey)) throw new InvalidFiscalInput('INVALID_ACCESS_KEY', 'Chave de acesso inválida');
+  const content = decodeXml(bytes);
   const parser = new SaxesParser({ xmlns: true });
   const stack: string[] = [];
   const fiscalNamespace: boolean[] = [];
